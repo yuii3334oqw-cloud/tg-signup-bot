@@ -82,11 +82,37 @@ def init_db():
                 user_name TEXT NOT NULL,
                 status TEXT NOT NULL,
                 extra INTEGER DEFAULT 0,
+                flakes INTEGER DEFAULT 0,
                 updated_at TEXT DEFAULT (datetime('now', 'localtime')),
                 PRIMARY KEY (activity_id, user_id)
             );
+            CREATE TABLE IF NOT EXISTS vote (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER,
+                title TEXT NOT NULL,
+                closed INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now', 'localtime'))
+            );
+            CREATE TABLE IF NOT EXISTS vote_option (
+                vote_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                PRIMARY KEY (vote_id, idx)
+            );
+            CREATE TABLE IF NOT EXISTS vote_ballot (
+                vote_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                user_name TEXT NOT NULL,
+                option_idx INTEGER NOT NULL,
+                PRIMARY KEY (vote_id, user_id)
+            );
             """
         )
+        try:  # 旧库补列
+            conn.execute("ALTER TABLE signup ADD COLUMN flakes INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
 
 
 # ---------------------------------------------------------------- 渲染
@@ -168,14 +194,208 @@ async def refresh_message(context, chat_id, message_id, activity_id):
             log.warning("edit failed: %s", e)
 
 
+# ---------------------------------------------------------------- 投票
+
+MEDALS = ["🥇", "🥈", "🥉"]
+
+
+def render_vote(conn, vote) -> str:
+    options = conn.execute(
+        "SELECT * FROM vote_option WHERE vote_id=? ORDER BY idx", (vote["id"],)
+    ).fetchall()
+    ballots = conn.execute(
+        "SELECT * FROM vote_ballot WHERE vote_id=?", (vote["id"],)
+    ).fetchall()
+    by_opt = {}
+    for b in ballots:
+        by_opt.setdefault(b["option_idx"], []).append(b["user_name"])
+
+    max_votes = max((len(v) for v in by_opt.values()), default=0)
+    lines = [f"🗳 <b>{html.escape(vote['title'])}</b>", ""]
+    for o in options:
+        voters = by_opt.get(o["idx"], [])
+        crown = " 👑" if voters and len(voters) == max_votes else ""
+        bar = "▓" * len(voters) if voters else "░"
+        lines.append(f"<b>{html.escape(o['text'])}</b> — {len(voters)} 票{crown}")
+        lines.append(bar)
+        if voters:
+            lines.append("(" + "、".join(html.escape(v) for v in voters) + ")")
+        lines.append("")
+    lines.append(f"共 {len(ballots)} 人投票")
+    if vote["closed"]:
+        lines.append("🔒 <b>投票已截止</b>")
+    else:
+        lines.append("👇 点按钮投票,再点一次取消,可随时改")
+    return "\n".join(lines).strip()
+
+
+def vote_keyboard(conn, vote_id: int) -> InlineKeyboardMarkup:
+    options = conn.execute(
+        "SELECT * FROM vote_option WHERE vote_id=? ORDER BY idx", (vote_id,)
+    ).fetchall()
+    rows, row = [], []
+    for o in options:
+        row.append(
+            InlineKeyboardButton(
+                o["text"], callback_data=f"v:{vote_id}:{o['idx']}"
+            )
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+async def refresh_vote_message(context, vote_id):
+    with _db_lock, db() as conn:
+        vote = conn.execute("SELECT * FROM vote WHERE id=?", (vote_id,)).fetchone()
+        if not vote:
+            return
+        text = render_vote(conn, vote)
+        markup = None if vote["closed"] else vote_keyboard(conn, vote_id)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=vote["chat_id"],
+            message_id=vote["message_id"],
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+        )
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            log.warning("edit vote failed: %s", e)
+
+
+async def cmd_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    parts = [p.strip() for p in " ".join(context.args).split("|") if p.strip()]
+    if len(parts) < 3:
+        await msg.reply_text(
+            "格式:/vote 主题 | 选项1 | 选项2 | ...\n"
+            "例:/vote 这周去哪 | 爬山 | 剧本杀 | 骑行"
+        )
+        return
+    title, options = parts[0], parts[1:][:10]  # 最多10个选项
+
+    with _db_lock, db() as conn:
+        cur = conn.execute(
+            "INSERT INTO vote(chat_id, title) VALUES (?,?)", (msg.chat_id, title)
+        )
+        vote_id = cur.lastrowid
+        for i, text in enumerate(options):
+            conn.execute(
+                "INSERT INTO vote_option(vote_id, idx, text) VALUES (?,?,?)",
+                (vote_id, i, text[:30]),
+            )
+        vote = conn.execute("SELECT * FROM vote WHERE id=?", (vote_id,)).fetchone()
+        body = render_vote(conn, vote)
+        markup = vote_keyboard(conn, vote_id)
+
+    sent = await msg.reply_text(body, parse_mode=ParseMode.HTML, reply_markup=markup)
+    with _db_lock, db() as conn:
+        conn.execute(
+            "UPDATE vote SET message_id=? WHERE id=?", (sent.message_id, vote_id)
+        )
+
+
+async def on_vote_button(update: Update, context: ContextTypes.DEFAULT_TYPE, vote_id, idx):
+    query = update.callback_query
+    user = query.from_user
+    with _db_lock, db() as conn:
+        vote = conn.execute("SELECT * FROM vote WHERE id=?", (vote_id,)).fetchone()
+        if not vote or vote["closed"]:
+            await query.answer("投票已截止", show_alert=True)
+            return
+        row = conn.execute(
+            "SELECT * FROM vote_ballot WHERE vote_id=? AND user_id=?",
+            (vote_id, user.id),
+        ).fetchone()
+        if row and row["option_idx"] == idx:
+            conn.execute(
+                "DELETE FROM vote_ballot WHERE vote_id=? AND user_id=?",
+                (vote_id, user.id),
+            )
+            feedback = "已取消投票"
+        else:
+            conn.execute(
+                "INSERT INTO vote_ballot(vote_id, user_id, user_name, option_idx)"
+                " VALUES (?,?,?,?)"
+                " ON CONFLICT(vote_id, user_id) DO UPDATE SET"
+                " option_idx=excluded.option_idx, user_name=excluded.user_name",
+                (vote_id, user.id, user.full_name, idx),
+            )
+            opt = conn.execute(
+                "SELECT text FROM vote_option WHERE vote_id=? AND idx=?",
+                (vote_id, idx),
+            ).fetchone()
+            feedback = f"已投给:{opt['text']}"
+    await query.answer(feedback)
+    await refresh_vote_message(context, vote_id)
+
+
+# ---------------------------------------------------------------- 排行榜
+
+async def cmd_rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_message.chat_id
+    with _db_lock, db() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.user_name,
+                   SUM(CASE WHEN s.status='going' THEN 1 ELSE 0 END) AS gone,
+                   SUM(s.flakes) AS flakes
+            FROM signup s JOIN activity a ON a.id = s.activity_id
+            WHERE a.chat_id=?
+            GROUP BY s.user_id
+            """,
+            (chat_id,),
+        ).fetchall()
+    if not rows:
+        await update.effective_message.reply_text(
+            "还没有任何报名记录,先 /new 搞几次活动吧!"
+        )
+        return
+
+    top = sorted(rows, key=lambda r: -r["gone"])[:10]
+    lines = ["🏆 <b>本群运动达人排行榜</b>", ""]
+    for i, r in enumerate(top):
+        if r["gone"] == 0:
+            continue
+        medal = MEDALS[i] if i < 3 else f"{i + 1}."
+        crown = "  👑运动达人" if i == 0 else ""
+        lines.append(
+            f"{medal} {html.escape(r['user_name'])} — 参加 {r['gone']} 次{crown}"
+        )
+
+    flakers = sorted(
+        [r for r in rows if r["flakes"] > 0], key=lambda r: -r["flakes"]
+    )[:3]
+    if flakers:
+        lines += ["", "🕊 <b>鸽子榜</b>(点了参加又跑路)", ""]
+        for r in flakers:
+            lines.append(
+                f"🕊 {html.escape(r['user_name'])} — 放鸽子 {r['flakes']} 次"
+            )
+        lines.append("")
+        lines.append(f"本届鸽王:{html.escape(flakers[0]['user_name'])} 🎉")
+
+    await update.effective_message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML
+    )
+
+
 # ---------------------------------------------------------------- 指令
 
 HELP_TEXT = (
     "🤖 <b>活动报名机器人</b>\n\n"
     "/new 活动名称 | 补充说明 — 发起报名\n"
     "例:<code>/new 周六爬山 | 早上8点西门集合,自带水</code>\n\n"
+    "/vote 主题 | 选项1 | 选项2 — 发起投票\n"
+    "例:<code>/vote 这周去哪 | 爬山 | 剧本杀 | 骑行</code>\n\n"
     "/stats — 查看本群进行中活动的报名统计\n"
-    "/close — 回复某条报名消息,截止该活动\n\n"
+    "/rank — 运动达人排行榜 + 鸽子榜 🕊\n"
+    "/close — 回复某条报名/投票消息,截止它\n\n"
     "报名直接点消息下面的按钮:参加 / 不参加 / 待定,"
     "带家属朋友的点「➕带1人」。"
 )
@@ -256,12 +476,29 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "SELECT * FROM activity WHERE chat_id=? AND message_id=?",
             (msg.chat_id, replied.message_id),
         ).fetchone()
+        vote = None
         if not activity:
-            await msg.reply_text("这条消息不是我发的报名消息哦。")
+            vote = conn.execute(
+                "SELECT * FROM vote WHERE chat_id=? AND message_id=?",
+                (msg.chat_id, replied.message_id),
+            ).fetchone()
+        if not activity and not vote:
+            await msg.reply_text("这条消息不是我发的报名/投票消息哦。")
             return
-        conn.execute("UPDATE activity SET closed=1 WHERE id=?", (activity["id"],))
-    await refresh_message(context, msg.chat_id, replied.message_id, activity["id"])
-    await msg.reply_text(f"已截止「{activity['title']}」的报名 ✅")
+        if activity:
+            conn.execute(
+                "UPDATE activity SET closed=1 WHERE id=?", (activity["id"],)
+            )
+        else:
+            conn.execute("UPDATE vote SET closed=1 WHERE id=?", (vote["id"],))
+    if activity:
+        await refresh_message(
+            context, msg.chat_id, replied.message_id, activity["id"]
+        )
+        await msg.reply_text(f"已截止「{activity['title']}」的报名 ✅")
+    else:
+        await refresh_vote_message(context, vote["id"])
+        await msg.reply_text(f"已截止「{vote['title']}」的投票 ✅")
 
 
 # ---------------------------------------------------------------- 按钮回调
@@ -269,6 +506,9 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     kind, activity_id, arg = query.data.split(":")
+    if kind == "v":
+        await on_vote_button(update, context, int(activity_id), int(arg))
+        return
     activity_id = int(activity_id)
     user = query.from_user
 
@@ -286,6 +526,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).fetchone()
 
         if kind == "s":  # 改状态
+            if row and row["status"] == GOING and arg == NOT_GOING:
+                conn.execute(  # 点了参加又跑路,记一笔鸽子账
+                    "UPDATE signup SET flakes=flakes+1"
+                    " WHERE activity_id=? AND user_id=?",
+                    (activity_id, user.id),
+                )
             conn.execute(
                 "INSERT INTO signup(activity_id, user_id, user_name, status, extra,"
                 " updated_at) VALUES (?,?,?,?,?, datetime('now','localtime'))"
@@ -326,6 +572,8 @@ def main():
     app.add_handler(CommandHandler(["start", "help"], cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("vote", cmd_vote))
+    app.add_handler(CommandHandler("rank", cmd_rank))
     app.add_handler(CommandHandler("close", cmd_close))
     app.add_handler(CallbackQueryHandler(on_button))
 
