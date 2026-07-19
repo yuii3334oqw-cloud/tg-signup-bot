@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-群活動報名統計機器人
+群活动报名统计机器人
 ====================
-用途:在 Telegram 群裏發起團建/爬山等活動報名,群成員點按鈕報名,
-機器人實時統計人數和名單。
+用途:在 Telegram 群里发起团建/爬山等活动报名,群成员点按钮报名,
+机器人实时统计人数和名单。
 
 指令:
-  /new 活動名稱 | 補充說明(可選)   發起一個新活動報名
-  /stats                           查看本群所有進行中活動的報名情況
-  /close                           (回覆某條報名消息)截止該活動報名
-  /help                            使用說明
+  /new 活动名称 | 补充说明(可选)   发起一个新活动报名
+  /stats                           查看本群所有进行中活动的报名情况
+  /close                           (回复某条报名消息)截止该活动报名
+  /help                            使用说明
 
-環境變量:
-  BOT_TOKEN     必填,@BotFather 給的 Token
-  WEBHOOK_URL   選填,填了就用 webhook 模式(如 https://xxx.onrender.com),
-                不填則用輪詢(polling)模式
-  PORT          webhook 模式監聽端口(Render 等平台會自動注入)
-  DB_PATH       選填,SQLite 數據庫路徑,默認 ./signup.db
+环境变量:
+  BOT_TOKEN     必填,@BotFather 给的 Token
+  WEBHOOK_URL   选填,填了就用 webhook 模式(如 https://xxx.onrender.com),
+                不填则用轮询(polling)模式
+  PORT          webhook 模式监听端口(Render 等平台会自动注入)
+  DB_PATH       选填,SQLite 数据库路径,默认 ./signup.db
 """
 
 import html
@@ -46,14 +46,14 @@ log = logging.getLogger("signup-bot")
 
 DB_PATH = os.environ.get("DB_PATH", "signup.db")
 
-# 報名狀態
+# 报名状态
 GOING, NOT_GOING, MAYBE = "going", "not_going", "maybe"
-STATUS_LABEL = {GOING: "✅ 參加", NOT_GOING: "❌ 不參加", MAYBE: "🤔 待定"}
+STATUS_LABEL = {GOING: "✅ 参加", NOT_GOING: "❌ 不参加", MAYBE: "🤔 待定"}
 
 _db_lock = threading.Lock()
 
 
-# ---------------------------------------------------------------- 數據庫
+# ---------------------------------------------------------------- 数据库
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -110,23 +110,23 @@ def render_activity(conn, activity) -> str:
     def block(title, people, show_extra=False):
         lines.append(title)
         if not people:
-            lines.append("(暫無)")
+            lines.append("(暂无)")
         for i, r in enumerate(people, 1):
             name = html.escape(r["user_name"])
             extra = f" +{r['extra']}" if (show_extra and r["extra"]) else ""
             lines.append(f"{i}. {name}{extra}")
         lines.append("")
 
-    block(f"✅ <b>參加({total} 人)</b>", going, show_extra=True)
+    block(f"✅ <b>参加({total} 人)</b>", going, show_extra=True)
     if maybe:
         block(f"🤔 <b>待定({len(maybe)} 人)</b>", maybe)
     if not_going:
-        block(f"❌ <b>不參加({len(not_going)} 人)</b>", not_going)
+        block(f"❌ <b>不参加({len(not_going)} 人)</b>", not_going)
 
     if activity["closed"]:
-        lines.append("🔒 <b>報名已截止</b>")
+        lines.append("🔒 <b>报名已截止</b>")
     else:
-        lines.append("👇 點下面按鈕報名,可隨時改")
+        lines.append("👇 点下面按钮报名,可随时改")
     return "\n".join(lines).strip()
 
 
@@ -134,13 +134,13 @@ def keyboard(activity_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ 參加", callback_data=f"s:{activity_id}:{GOING}"),
-                InlineKeyboardButton("❌ 不參加", callback_data=f"s:{activity_id}:{NOT_GOING}"),
+                InlineKeyboardButton("✅ 参加", callback_data=f"s:{activity_id}:{GOING}"),
+                InlineKeyboardButton("❌ 不参加", callback_data=f"s:{activity_id}:{NOT_GOING}"),
                 InlineKeyboardButton("🤔 待定", callback_data=f"s:{activity_id}:{MAYBE}"),
             ],
             [
-                InlineKeyboardButton("➕ 帶1人", callback_data=f"e:{activity_id}:+"),
-                InlineKeyboardButton("➖ 減1人", callback_data=f"e:{activity_id}:-"),
+                InlineKeyboardButton("➕ 带1人", callback_data=f"e:{activity_id}:+"),
+                InlineKeyboardButton("➖ 减1人", callback_data=f"e:{activity_id}:-"),
             ],
         ]
     )
@@ -163,7 +163,7 @@ async def refresh_message(context, chat_id, message_id, activity_id):
             parse_mode=ParseMode.HTML,
             reply_markup=None if closed else keyboard(activity_id),
         )
-    except Exception as e:  # 內容沒變化時 Telegram 會報錯,忽略即可
+    except Exception as e:  # 内容没变化时 Telegram 会报错,忽略即可
         if "not modified" not in str(e).lower():
             log.warning("edit failed: %s", e)
 
@@ -171,13 +171,13 @@ async def refresh_message(context, chat_id, message_id, activity_id):
 # ---------------------------------------------------------------- 指令
 
 HELP_TEXT = (
-    "🤖 <b>活動報名機器人</b>\n\n"
-    "/new 活動名稱 | 補充說明 — 發起報名\n"
-    "例:<code>/new 週六爬山 | 早上8點西門集合,自帶水</code>\n\n"
-    "/stats — 查看本群進行中活動的報名統計\n"
-    "/close — 回覆某條報名消息,截止該活動\n\n"
-    "報名直接點消息下面的按鈕:參加 / 不參加 / 待定,"
-    "帶家屬朋友的點「➕帶1人」。"
+    "🤖 <b>活动报名机器人</b>\n\n"
+    "/new 活动名称 | 补充说明 — 发起报名\n"
+    "例:<code>/new 周六爬山 | 早上8点西门集合,自带水</code>\n\n"
+    "/stats — 查看本群进行中活动的报名统计\n"
+    "/close — 回复某条报名消息,截止该活动\n\n"
+    "报名直接点消息下面的按钮:参加 / 不参加 / 待定,"
+    "带家属朋友的点「➕带1人」。"
 )
 
 
@@ -190,7 +190,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args_text = " ".join(context.args).strip()
     if not args_text:
         await msg.reply_text(
-            "請帶上活動名稱,例如:\n/new 週六爬山 | 早上8點西門集合",
+            "请带上活动名称,例如:\n/new 周六爬山 | 早上8点西门集合",
         )
         return
     title, _, note = args_text.partition("|")
@@ -217,7 +217,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "UPDATE activity SET message_id=? WHERE id=?",
             (sent.message_id, activity_id),
         )
-    # 嘗試置頂(機器人需要是管理員,失敗就算了)
+    # 尝试置顶(机器人需要是管理员,失败就算了)
     try:
         await context.bot.pin_chat_message(
             msg.chat_id, sent.message_id, disable_notification=True
@@ -236,7 +236,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).fetchall()
         if not activities:
             await update.effective_message.reply_text(
-                "本群當前沒有進行中的活動。用 /new 活動名稱 發起一個吧!"
+                "本群当前没有进行中的活动。用 /new 活动名称 发起一个吧!"
             )
             return
         parts = [render_activity(conn, a) for a in activities]
@@ -249,7 +249,7 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     replied = msg.reply_to_message
     if not replied:
-        await msg.reply_text("請「回覆」要截止的那條報名消息再發 /close。")
+        await msg.reply_text("请「回复」要截止的那条报名消息再发 /close。")
         return
     with _db_lock, db() as conn:
         activity = conn.execute(
@@ -257,14 +257,14 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (msg.chat_id, replied.message_id),
         ).fetchone()
         if not activity:
-            await msg.reply_text("這條消息不是我發的報名消息哦。")
+            await msg.reply_text("这条消息不是我发的报名消息哦。")
             return
         conn.execute("UPDATE activity SET closed=1 WHERE id=?", (activity["id"],))
     await refresh_message(context, msg.chat_id, replied.message_id, activity["id"])
-    await msg.reply_text(f"已截止「{activity['title']}」的報名 ✅")
+    await msg.reply_text(f"已截止「{activity['title']}」的报名 ✅")
 
 
-# ---------------------------------------------------------------- 按鈕回調
+# ---------------------------------------------------------------- 按钮回调
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -277,7 +277,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "SELECT * FROM activity WHERE id=?", (activity_id,)
         ).fetchone()
         if not activity or activity["closed"]:
-            await query.answer("報名已截止", show_alert=True)
+            await query.answer("报名已截止", show_alert=True)
             return
 
         row = conn.execute(
@@ -285,7 +285,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (activity_id, user.id),
         ).fetchone()
 
-        if kind == "s":  # 改狀態
+        if kind == "s":  # 改状态
             conn.execute(
                 "INSERT INTO signup(activity_id, user_id, user_name, status, extra,"
                 " updated_at) VALUES (?,?,?,?,?, datetime('now','localtime'))"
@@ -296,17 +296,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (activity_id, user.id, user.full_name, arg,
                  (row["extra"] if row and arg == GOING else 0)),
             )
-            feedback = f"已登記:{STATUS_LABEL[arg]}"
-        else:  # kind == "e",加減攜帶人數
+            feedback = f"已登记:{STATUS_LABEL[arg]}"
+        else:  # kind == "e",加减携带人数
             if not row or row["status"] != GOING:
-                await query.answer("先點「✅ 參加」才能帶人哦", show_alert=True)
+                await query.answer("先点「✅ 参加」才能带人哦", show_alert=True)
                 return
             new_extra = max(0, row["extra"] + (1 if arg == "+" else -1))
             conn.execute(
                 "UPDATE signup SET extra=? WHERE activity_id=? AND user_id=?",
                 (new_extra, activity_id, user.id),
             )
-            feedback = f"你共帶 {new_extra} 人"
+            feedback = f"你共带 {new_extra} 人"
 
     await query.answer(feedback)
     await refresh_message(
@@ -314,12 +314,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------------------------------------------------------------- 啟動
+# ---------------------------------------------------------------- 启动
 
 def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
-        raise SystemExit("請設置環境變量 BOT_TOKEN(@BotFather 給的 Token)")
+        raise SystemExit("请设置环境变量 BOT_TOKEN(@BotFather 给的 Token)")
 
     init_db()
     app = Application.builder().token(token).build()
