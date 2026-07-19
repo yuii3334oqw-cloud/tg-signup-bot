@@ -24,6 +24,7 @@ import logging
 import os
 import sqlite3
 import threading
+from datetime import datetime
 
 from telegram import (
     InlineKeyboardButton,
@@ -115,6 +116,19 @@ def init_db():
             pass
 
 
+# 活动模板字段 → 图标
+FIELD_EMOJI = {
+    "活动时间": "🕐",
+    "活动地点": "📍",
+    "集合地点": "🚩",
+    "活动内容": "🎯",
+    "活动费用": "💰",
+    "参与人数": "👥",
+    "注意事项": "⚠️",
+    "报名方式": "📝",
+}
+
+
 # ---------------------------------------------------------------- 渲染
 
 def render_activity(conn, activity) -> str:
@@ -130,7 +144,18 @@ def render_activity(conn, activity) -> str:
 
     lines = [f"📋 <b>{html.escape(activity['title'])}</b>"]
     if activity["note"]:
-        lines.append(html.escape(activity["note"]))
+        lines.append("")
+        for note_line in activity["note"].split("\n"):
+            note_line = note_line.strip()
+            if not note_line:
+                continue
+            decorated = html.escape(note_line)
+            for key, emoji in FIELD_EMOJI.items():
+                if note_line.startswith(key):
+                    rest = note_line[len(key):].lstrip(":: ")
+                    decorated = f"{emoji} <b>{key}</b>:{html.escape(rest)}"
+                    break
+            lines.append(decorated)
     lines.append("")
 
     def block(title, people, show_extra=False):
@@ -344,6 +369,9 @@ async def on_vote_button(update: Update, context: ContextTypes.DEFAULT_TYPE, vot
 
 async def cmd_rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_message.chat_id
+    now = datetime.now()
+    month_key = now.strftime("%Y-%m")
+    month_label = f"{now.month}月"
     with _db_lock, db() as conn:
         rows = conn.execute(
             """
@@ -351,39 +379,35 @@ async def cmd_rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    SUM(CASE WHEN s.status='going' THEN 1 ELSE 0 END) AS gone,
                    SUM(s.flakes) AS flakes
             FROM signup s JOIN activity a ON a.id = s.activity_id
-            WHERE a.chat_id=?
+            WHERE a.chat_id=? AND strftime('%Y-%m', a.created_at)=?
             GROUP BY s.user_id
             """,
-            (chat_id,),
+            (chat_id, month_key),
         ).fetchall()
-    if not rows:
+    if not rows or all(r["gone"] == 0 for r in rows):
         await update.effective_message.reply_text(
-            "还没有任何报名记录,先 /new 搞几次活动吧!"
+            f"{month_label}还没有报名记录,先 /new 搞几次活动吧!"
         )
         return
 
+    sep = "➖➖➖➖➖➖➖➖"
     top = sorted(rows, key=lambda r: -r["gone"])[:10]
-    lines = ["🏆 <b>本群运动达人排行榜</b>", ""]
+    lines = [f"🏆 <b>{month_label}运动达人排行榜</b>", sep]
     for i, r in enumerate(top):
         if r["gone"] == 0:
             continue
-        medal = MEDALS[i] if i < 3 else f"{i + 1}."
-        crown = "  👑运动达人" if i == 0 else ""
-        lines.append(
-            f"{medal} {html.escape(r['user_name'])} — 参加 {r['gone']} 次{crown}"
-        )
+        medal = MEDALS[i] if i < 3 else f" {i + 1}. "
+        crown = " 👑" if i == 0 else ""
+        lines.append(f"{medal} {html.escape(r['user_name'])} · {r['gone']}次{crown}")
 
     flakers = sorted(
         [r for r in rows if r["flakes"] > 0], key=lambda r: -r["flakes"]
     )[:3]
     if flakers:
-        lines += ["", "🕊 <b>鸽子榜</b>(点了参加又跑路)", ""]
+        lines += [sep, "🕊 <b>本月鸽子榜</b>"]
         for r in flakers:
-            lines.append(
-                f"🕊 {html.escape(r['user_name'])} — 放鸽子 {r['flakes']} 次"
-            )
-        lines.append("")
-        lines.append(f"本届鸽王:{html.escape(flakers[0]['user_name'])} 🎉")
+            lines.append(f"🕊 {html.escape(r['user_name'])} · {r['flakes']}次")
+        lines.append(f"本月鸽王:{html.escape(flakers[0]['user_name'])} 🎉")
 
     await update.effective_message.reply_text(
         "\n".join(lines), parse_mode=ParseMode.HTML
@@ -395,11 +419,12 @@ async def cmd_rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 HELP_TEXT = (
     "🤖 <b>活动报名机器人</b>\n\n"
     "/new 活动名称 | 补充说明 — 发起报名\n"
-    "例:<code>/new 周六爬山 | 早上8点西门集合,自带水</code>\n\n"
+    "例:<code>/new 周六爬山 | 早上8点西门集合,自带水</code>\n"
+    "也支持多行活动模板,/new 后直接换行粘贴模板即可\n\n"
     "/vote 主题 选项1 选项2 — 发起投票\n"
     "例:<code>/vote 这周去哪 爬山 剧本杀 骑行</code>\n\n"
     "/stats — 查看本群进行中活动的报名统计\n"
-    "/rank — 运动达人排行榜 + 鸽子榜 🕊\n"
+    "/rank — 本月运动达人排行榜 + 鸽子榜 🕊\n"
     "/close — 回复某条报名/投票消息,截止它\n\n"
     "报名直接点消息下面的按钮:参加 / 不参加 / 待定,"
     "带家属朋友的点「➕带1人」。"
@@ -412,14 +437,33 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    args_text = " ".join(context.args).strip()
+    raw = msg.text or ""
+    split = raw.split(None, 1)  # 去掉 /new 指令本身
+    args_text = split[1].strip() if len(split) > 1 else ""
     if not args_text:
         await msg.reply_text(
-            "请带上活动名称,例如:\n/new 周六爬山 | 早上8点西门集合",
+            "请带上活动名称,例如:\n"
+            "/new 周六爬山 | 早上8点西门集合\n\n"
+            "也支持多行模板(每行一项):\n"
+            "/new 标题:城市徒步|XX公园(8月10日)\n"
+            "活动时间:8月10日 09:00-12:00\n"
+            "活动地点:XX公园\n"
+            "集合地点:XX公园南门\n"
+            "活动内容:徒步+拍照,约8公里\n"
+            "活动费用:免费(餐饮AA)\n"
+            "参与人数:5-20人\n"
+            "注意事项:穿运动鞋,自备水",
         )
         return
-    title, _, note = args_text.partition("|")
-    title, note = title.strip(), note.strip()
+    if "\n" in args_text:  # 多行模板:第一行是标题,其余原样保留
+        template_lines = [l.strip() for l in args_text.split("\n") if l.strip()]
+        title = template_lines[0]
+        if title.startswith("标题"):
+            title = title[2:].lstrip(":: ").strip()
+        note = "\n".join(template_lines[1:])
+    else:  # 单行写法:标题 | 说明
+        title, _, note = args_text.partition("|")
+        title, note = title.strip(), note.strip()
 
     user = update.effective_user
     with _db_lock, db() as conn:
