@@ -270,11 +270,16 @@ async def refresh_vote_message(context, vote_id):
 
 async def cmd_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    parts = [p.strip() for p in " ".join(context.args).split("|") if p.strip()]
+    raw = " ".join(context.args)
+    if "|" in raw:  # 带竖线写法:选项可以含空格
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
+    else:  # 空格写法:第一个词是主题,后面都是选项
+        parts = raw.split()
     if len(parts) < 3:
         await msg.reply_text(
-            "格式:/vote 主题 | 选项1 | 选项2 | ...\n"
-            "例:/vote 这周去哪 | 爬山 | 剧本杀 | 骑行"
+            "格式:/vote 主题 选项1 选项2 ...\n"
+            "例:/vote 这周去哪 爬山 剧本杀 骑行\n"
+            "(选项本身带空格就用 | 隔开)"
         )
         return
     title, options = parts[0], parts[1:][:10]  # 最多10个选项
@@ -391,8 +396,8 @@ HELP_TEXT = (
     "🤖 <b>活动报名机器人</b>\n\n"
     "/new 活动名称 | 补充说明 — 发起报名\n"
     "例:<code>/new 周六爬山 | 早上8点西门集合,自带水</code>\n\n"
-    "/vote 主题 | 选项1 | 选项2 — 发起投票\n"
-    "例:<code>/vote 这周去哪 | 爬山 | 剧本杀 | 骑行</code>\n\n"
+    "/vote 主题 选项1 选项2 — 发起投票\n"
+    "例:<code>/vote 这周去哪 爬山 剧本杀 骑行</code>\n\n"
     "/stats — 查看本群进行中活动的报名统计\n"
     "/rank — 运动达人排行榜 + 鸽子榜 🕊\n"
     "/close — 回复某条报名/投票消息,截止它\n\n"
